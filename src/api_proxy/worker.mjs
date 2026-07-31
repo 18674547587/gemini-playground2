@@ -61,9 +61,13 @@ class HttpError extends Error {
   }
 }
 
+// 代理版本标识：用于确认部署是否运行最新代码
+const PROXY_VERSION = "v4.3.0";
+
 const fixCors = ({ headers, status, statusText }) => {
   headers = new Headers(headers);
   headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("X-Proxy-Version", PROXY_VERSION);
   return { headers, status, statusText };
 };
 
