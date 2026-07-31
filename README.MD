@@ -79,6 +79,18 @@ Mac/Linux 安装Deno:
 
 
 ### API 代理
+
+#### 双入口模式
+
+项目提供两个独立入口，互不干扰：
+
+| 入口 | 路径 | 说明 |
+|---|---|---|
+| **OpenAI 兼容** | `/openai/v1/chat/completions` | OpenAI 格式请求自动转换为 Gemini 格式，适合 ChatBox / Cursor 等 OpenAI 客户端 |
+| **Gemini 原生** | `/gemini/v1beta/...` | 原生格式**零转换透传**，thought_signature 等由客户端 SDK 管理，适合支持 Gemini 原生接口的客户端（也兼容 `/gemni` 拼写） |
+
+无前缀路径（`/v1/chat/completions`、`/v1beta/...`）自动识别，向后兼容。
+
 API已经被代理为OpenAI格式，可以直接使用OpenAI格式的API。
 不限网络环境，可免梯子使用。
 注意替换域名与Gemini API Key。

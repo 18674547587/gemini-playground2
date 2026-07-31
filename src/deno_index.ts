@@ -93,7 +93,10 @@ async function handleRequest(req: Request): Promise<Response> {
     return handleWebSocket(req);
   }
 
-  if (url.pathname.startsWith("/v1beta/") ||
+  if (url.pathname.startsWith("/openai") ||
+      url.pathname.startsWith("/gemini") ||
+      url.pathname.startsWith("/gemni") ||
+      url.pathname.startsWith("/v1beta/") ||
       url.pathname.endsWith("/chat/completions") ||
       url.pathname.endsWith("/embeddings") ||
       url.pathname.endsWith("/models")) {

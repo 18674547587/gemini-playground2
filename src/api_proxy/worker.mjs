@@ -31,20 +31,24 @@ export default {
         }
       };
       const { pathname } = new URL(request.url);
-      switch (true) {
-        case isNativeProxyPath(pathname):
-          // Gemini 原生接口透传模式：客户端原生格式请求原样转发，不做转换
-          return handleNativeProxy(request, apiKey)
+      // 双入口兼容：
+      //   /openai/...  → OpenAI 兼容转换模式（剥离前缀后按 OpenAI 路径处理）
+      //   /gemini/...  → Gemini 原生透传模式（剥离前缀后按原生路径处理）
+      //   （同时兼容 /gemni 拼写别名；无前缀时按原始路径自动识别）
+      const { type, path } = classifyPath(pathname);
+      switch (type) {
+        case "native":
+          return handleNativeProxy(request, apiKey, path)
             .catch(errHandler);
-        case pathname.endsWith("/chat/completions"):
+        case "completions":
           assert(request.method === "POST");
           return handleCompletions(await request.json(), apiKey)
             .catch(errHandler);
-        case pathname.endsWith("/embeddings"):
+        case "embeddings":
           assert(request.method === "POST");
           return handleEmbeddings(await request.json(), apiKey)
             .catch(errHandler);
-        case pathname.endsWith("/models"):
+        case "models":
           assert(request.method === "GET");
           return handleModels(apiKey)
             .catch(errHandler);
@@ -66,7 +70,7 @@ class HttpError extends Error {
 }
 
 // 代理版本标识：用于确认部署是否运行最新代码
-const PROXY_VERSION = "v4.4.0";
+const PROXY_VERSION = "v4.5.0";
 
 const fixCors = ({ headers, status, statusText }) => {
   headers = new Headers(headers);
@@ -98,10 +102,39 @@ const API_VERSION = "v1beta";
 const isNativeProxyPath = (pathname) =>
   typeof pathname === "string" && pathname.startsWith("/v1beta/");
 
+// 路径前缀剥离：/openai → /，/openai/xxx → /xxx；不匹配返回 null
+const stripPrefix = (pathname, prefix) => {
+  if (pathname === prefix) { return "/"; }
+  if (typeof pathname === "string" && pathname.startsWith(prefix + "/")) {
+    return pathname.slice(prefix.length);
+  }
+  return null;
+};
+
+// 路径分类：剥离可选前缀后识别请求类型
+//  - /openai/*   → OpenAI 兼容模式（completions/embeddings/models）
+//  - /gemini/*   → Gemini 原生透传模式（native）
+//  - /gemni/*    → 同上（拼写别名）
+//  - 无前缀      → 自动识别（向后兼容）
+const classifyPath = (pathname) => {
+  const p =
+    stripPrefix(pathname, "/openai") ??
+    stripPrefix(pathname, "/gemini") ??
+    stripPrefix(pathname, "/gemni") ??
+    pathname;
+  if (isNativeProxyPath(p)) { return { type: "native", path: p }; }
+  if (p.endsWith("/chat/completions")) { return { type: "completions", path: p }; }
+  if (p.endsWith("/embeddings")) { return { type: "embeddings", path: p }; }
+  if (p.endsWith("/models")) { return { type: "models", path: p }; }
+  return { type: "unknown", path: p };
+};
+
 // 透传处理：构造目标 URL + 归一化鉴权 + 原样转发
-const handleNativeProxy = async (request, bearerKey) => {
+// overridePathname：剥离前缀后的路径（如 /gemini/v1beta/... → /v1beta/...）
+const handleNativeProxy = async (request, bearerKey, overridePathname) => {
   const url = new URL(request.url);
-  const targetUrl = `${BASE_URL}${url.pathname}${url.search}`;
+  const pathname = overridePathname ?? url.pathname;
+  const targetUrl = `${BASE_URL}${pathname}${url.search}`;
 
   const headers = new Headers(request.headers);
   // 清理 hop-by-hop 与本地代理相关头
@@ -852,6 +885,8 @@ async function toOpenAiStreamFlush (controller) {
 // 导出内部转换函数（仅用于测试与二次开发，不影响 default export）
 export {
   isNativeProxyPath,
+  stripPrefix,
+  classifyPath,
   transformTools,
   transformTool,
   transformToolChoice,

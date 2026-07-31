@@ -365,3 +365,36 @@ console.log("1️⃣4️⃣ Gemini 原生透传模式（路径识别 + 不干扰
 }
 
 console.log(`\n🎉 全部 ${passed + 1} 组测试通过！`);
+
+console.log("1️⃣5️⃣ 严格双入口 /openai 与 /gemini(/gemni) 路径分类");
+{
+  const { classifyPath, stripPrefix } = await import("./src/api_proxy/worker.mjs");
+
+  // stripPrefix
+  assert.equal(stripPrefix("/openai/v1/chat/completions", "/openai"), "/v1/chat/completions");
+  assert.equal(stripPrefix("/openai", "/openai"), "/");
+  assert.equal(stripPrefix("/gemini/v1beta/models", "/gemini"), "/v1beta/models");
+  assert.equal(stripPrefix("/other/x", "/openai"), null);
+  ok("stripPrefix 前缀剥离正确");
+
+  // OpenAI 入口
+  assert.equal(classifyPath("/openai/v1/chat/completions").type, "completions");
+  assert.equal(classifyPath("/openai/v1/models").type, "models");
+  assert.equal(classifyPath("/openai/v1/embeddings").type, "embeddings");
+  ok("OpenAI 请求只走 /openai → 转换模式");
+
+  // Gemini 入口（含别名）
+  assert.equal(classifyPath("/gemini/v1beta/models/gemini-3-flash:generateContent").type, "native");
+  assert.equal(classifyPath("/gemini/v1beta/models").type, "native");
+  assert.equal(classifyPath("/gemni/v1beta/models/gemini-3-flash:streamGenerateContent").type, "native");
+  ok("Gemini 请求只走 /gemini(/gemni) → 原生透传");
+
+  // 无前缀向后兼容
+  assert.equal(classifyPath("/v1beta/models").type, "native");
+  assert.equal(classifyPath("/v1/chat/completions").type, "completions");
+  assert.equal(classifyPath("/").type, "unknown");
+  assert.equal(classifyPath("/favicon.ico").type, "unknown");
+  ok("无前缀路径自动识别，向后兼容");
+}
+
+console.log(`\n🎉 全部 ${passed + 1} 组测试通过！`);
