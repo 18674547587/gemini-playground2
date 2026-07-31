@@ -311,7 +311,12 @@ const transformMsg = async ({ role, content, tool_calls }) => {
       } else if (tc.function.arguments && typeof tc.function.arguments === "object") {
         args = tc.function.arguments;
       }
-      parts.push({ functionCall: { name: tc.function.name, args } });
+      const fc = { name: tc.function.name, args };
+      // 透传 thought_signature（Gemini 思考模型必需，保证多轮工具调用不降级）
+      if (tc.thought_signature) {
+        fc.thought_signature = tc.thought_signature;
+      }
+      parts.push({ functionCall: fc });
     }
   }
 
@@ -375,21 +380,30 @@ const transformMessages = async (messages) => {
       if (Array.isArray(item.tool_calls)) {
         for (const tc of item.tool_calls) {
           if (tc.id && tc.function?.name) {
-            toolCallMap.set(tc.id, tc.function.name);
+            toolCallMap.set(tc.id, {
+              name: tc.function.name,
+              thought_signature: tc.thought_signature,
+            });
           }
         }
       }
       contents.push(await transformMsg({ ...item, role: "model" }));
     } else if (role === "tool") {
       // OpenAI: { role:"tool", tool_call_id, content } → Gemini functionResponse（user 角色）
-      const name = item.name || toolCallMap.get(item.tool_call_id);
+      const meta = toolCallMap.get(item.tool_call_id) || {};
+      const name = item.name || meta.name;
       let response = item.content;
       if (typeof response === "string") {
         try { response = JSON.parse(response); } catch { /* 保留字符串 */ }
       }
+      const fcResp = { name, response };
+      // 透传 thought_signature（Gemini 思考模型必需）
+      if (item.thought_signature || meta.thought_signature) {
+        fcResp.thought_signature = item.thought_signature || meta.thought_signature;
+      }
       contents.push({
         role: "user",
-        parts: [{ functionResponse: { name, response } }],
+        parts: [{ functionResponse: fcResp }],
       });
     } else {
       // user（含 role 缺失/未知的情况按 user 处理）
@@ -554,14 +568,21 @@ const transformCandidates = (key, cand) => {
 
   let finish_reason = reasonsMap[cand.finishReason] || cand.finishReason;
   if (callParts.length > 0) {
-    message.tool_calls = callParts.map(p => ({
-      id: generateToolCallId(),
-      type: "function",
-      function: {
-        name: p.functionCall.name,
-        arguments: JSON.stringify(p.functionCall.args ?? {}),
-      },
-    }));
+    message.tool_calls = callParts.map(p => {
+      const tc = {
+        id: generateToolCallId(),
+        type: "function",
+        function: {
+          name: p.functionCall.name,
+          arguments: JSON.stringify(p.functionCall.args ?? {}),
+        },
+      };
+      // Gemini 思考模型：透传 thought_signature（缺失会导致后续轮次工具调用报错/降级）
+      if (p.functionCall.thought_signature) {
+        tc.thought_signature = p.functionCall.thought_signature;
+      }
+      return tc;
+    });
     finish_reason = "tool_calls";
   }
 
@@ -632,15 +653,22 @@ function transformResponseStream (data, stop, first) {
     delta.content = (delta.content ?? "") + textParts.map(p => p.text).join("");
   }
   if (callParts.length > 0) {
-    delta.tool_calls = callParts.map(p => ({
-      index: this.toolCallIndex++,
-      id: generateToolCallId(),
-      type: "function",
-      function: {
-        name: p.functionCall.name,
-        arguments: JSON.stringify(p.functionCall.args ?? {}),
-      },
-    }));
+    delta.tool_calls = callParts.map(p => {
+      const tc = {
+        index: this.toolCallIndex++,
+        id: generateToolCallId(),
+        type: "function",
+        function: {
+          name: p.functionCall.name,
+          arguments: JSON.stringify(p.functionCall.args ?? {}),
+        },
+      };
+      // Gemini 思考模型：透传 thought_signature（缺失会导致后续轮次工具调用报错/降级）
+      if (p.functionCall.thought_signature) {
+        tc.thought_signature = p.functionCall.thought_signature;
+      }
+      return tc;
+    });
   }
 
   const item = {

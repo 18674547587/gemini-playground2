@@ -234,3 +234,47 @@ console.log("🔟 JSON Schema 清洗（const → enum、删除不支持字段、
 }
 
 console.log(`\n🎉 全部 ${passed + 1} 组测试通过！`);
+
+console.log("1️⃣1️⃣ thought_signature 透传（响应 + 请求 + 工具结果 全链路）");
+{
+  // A. 响应方向：Gemini functionCall 带签名 → OpenAI tool_call 带签名
+  const cand = {
+    index: 0,
+    content: { parts: [{ functionCall: { name: "workspace_shell", args: { cmd: "ls" }, thought_signature: "SIG_abc123" } }] },
+    finishReason: "STOP",
+  };
+  const out = transformCandidates("message", cand);
+  assert.equal(out.message.tool_calls[0].thought_signature, "SIG_abc123");
+  ok("响应方向：thought_signature 从 functionCall 透传到 tool_call");
+
+  // B. 请求方向：assistant tool_calls 带签名 → functionCall part 带签名
+  const messages = [
+    { role: "system", content: "助手" },
+    { role: "user", content: "执行 ls" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "workspace_shell", arguments: "{\"cmd\":\"ls\"}" }, thought_signature: "SIG_abc123" }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: "{\"result\":\"ok\"}" },
+    { role: "user", content: "继续" },
+  ];
+  const { contents } = await transformMessages(messages);
+  // assistant → model functionCall
+  assert.equal(contents[1].parts[0].functionCall.thought_signature, "SIG_abc123");
+  ok("请求方向：thought_signature 从 tool_call 透传到 functionCall part");
+  // tool → functionResponse 也带签名
+  assert.equal(contents[2].parts[0].functionResponse.thought_signature, "SIG_abc123");
+  ok("工具结果：functionResponse 自动带上对应 tool_call 的签名");
+
+  // C. 无签名时不受影响（向后兼容）
+  const noSig = transformCandidates("message", {
+    index: 0,
+    content: { parts: [{ functionCall: { name: "f", args: {} } }] },
+    finishReason: "STOP",
+  });
+  assert.equal(noSig.message.tool_calls[0].thought_signature, undefined);
+  ok("无签名时正常透传 undefined，向后兼容");
+}
+
+console.log(`\n🎉 全部 ${passed + 1} 组测试通过！`);
