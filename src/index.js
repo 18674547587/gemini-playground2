@@ -22,10 +22,15 @@ export default {
         return handleAPIRequest(request, env);
       }
 
-      // 处理静态资源：优先新版 assets 绑定（env.ASSETS），
-      // 自动处理 content-type 与缓存；回退旧版 Workers Sites KV（__STATIC_CONTENT）
+      // 处理静态资源：优先新版 assets 绑定（env.ASSETS）
+      // 自动处理 content-type 与缓存；对不存在的文件返回 404
       if (env.ASSETS && typeof env.ASSETS.fetch === "function") {
-        return env.ASSETS.fetch(request);
+        try {
+          return await env.ASSETS.fetch(request);
+        } catch (e) {
+          // ASSETS 异常（边缘情况）：回退到下方 KV / 404 逻辑
+          console.warn("ASSETS fetch failed, fallback:", e?.message ?? e);
+        }
       }
 
       // 旧版 Workers Sites KV 回退
