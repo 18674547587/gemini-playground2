@@ -85,45 +85,56 @@ async function handleAPIRequest(req: Request): Promise<Response> {
 }
 
 async function handleRequest(req: Request): Promise<Response> {
-  const url = new URL(req.url);
-  console.log('Request URL:', req.url);
-
-  // WebSocket 处理
-  if (req.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-    return handleWebSocket(req);
-  }
-
-  if (url.pathname.startsWith("/openai") ||
-      url.pathname.startsWith("/gemini") ||
-      url.pathname.startsWith("/gemni") ||
-      url.pathname.startsWith("/v1beta/") ||
-      url.pathname.endsWith("/chat/completions") ||
-      url.pathname.endsWith("/embeddings") ||
-      url.pathname.endsWith("/models")) {
-    return handleAPIRequest(req);
-  }
-
-  // 静态文件处理
+  // 全局兜底：任何意外异常都不允许击穿到 Deno.serve（防止进程崩溃）
   try {
-    let filePath = url.pathname;
-    if (filePath === '/' || filePath === '/index.html') {
-      filePath = '/index.html';
+    const url = new URL(req.url);
+
+    // WebSocket 处理
+    if (req.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      return handleWebSocket(req);
     }
 
-    const fullPath = `${Deno.cwd()}/src/static${filePath}`;
+    if (url.pathname.startsWith("/openai") ||
+        url.pathname.startsWith("/gemini") ||
+        url.pathname.startsWith("/gemni") ||
+        url.pathname.startsWith("/v1beta/") ||
+        url.pathname.endsWith("/chat/completions") ||
+        url.pathname.endsWith("/embeddings") ||
+        url.pathname.endsWith("/models")) {
+      return handleAPIRequest(req);
+    }
 
-    const file = await Deno.readFile(fullPath);
-    const contentType = getContentType(filePath);
+    // 静态文件处理
+    try {
+      let filePath = url.pathname;
+      if (filePath === '/' || filePath === '/index.html') {
+        filePath = '/index.html';
+      }
 
-    return new Response(file, {
-      headers: {
-        'content-type': `${contentType};charset=UTF-8`,
-      },
-    });
+      const fullPath = `${Deno.cwd()}/src/static${filePath}`;
+
+      const file = await Deno.readFile(fullPath);
+      const contentType = getContentType(filePath);
+
+      return new Response(file, {
+        headers: {
+          'content-type': `${contentType};charset=UTF-8`,
+        },
+      });
+    } catch (e) {
+      // 静态文件不存在 → 正常 404，不打印堆栈（避免日志刷屏）
+      return new Response('Not Found', {
+        status: 404,
+        headers: {
+          'content-type': 'text/plain;charset=UTF-8',
+        }
+      });
+    }
   } catch (e) {
-    console.error('Error details:', e);
-    return new Response('Not Found', { 
-      status: 404,
+    // 意外异常：返回 500，绝不崩溃
+    console.error('Unhandled request error:', e);
+    return new Response('Internal Server Error', {
+      status: 500,
       headers: {
         'content-type': 'text/plain;charset=UTF-8',
       }

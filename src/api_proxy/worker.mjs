@@ -19,8 +19,16 @@ export default {
       return handleOPTIONS();
     }
     const errHandler = (err) => {
-      console.error(err);
-      return new Response(err.message, fixCors({ status: err.status ?? 500 }));
+      const status = err.status ?? 500;
+      if (status >= 500) {
+        // 服务器内部错误：打印完整堆栈便于排查
+        console.error(err);
+      } else {
+        // 客户端错误（404/400 等）：简短记录，避免刷爆日志
+        console.warn(`[proxy] ${status} ${err.message}`);
+      }
+      const body = status === 404 ? "Not Found" : err.message;
+      return new Response(body, fixCors({ status }));
     };
     try {
       const auth = request.headers.get("Authorization");
@@ -53,7 +61,7 @@ export default {
           return handleModels(apiKey)
             .catch(errHandler);
         default:
-          throw new HttpError("404 Not Found", 404);
+          throw new HttpError("Not Found", 404);
       }
     } catch (err) {
       return errHandler(err);

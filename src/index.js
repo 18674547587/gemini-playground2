@@ -2,48 +2,51 @@ const assetManifest = {};
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+    // 全局兜底：任何意外异常都不允许外泄（返回 500 而非请求失败）
+    try {
+      const url = new URL(request.url);
 
-    // 处理 WebSocket 连接
-    if (request.headers.get('Upgrade') === 'websocket') {
-      return handleWebSocket(request, env);
+      // 处理 WebSocket 连接
+      if (request.headers.get('Upgrade') === 'websocket') {
+        return handleWebSocket(request, env);
+      }
+
+      // 添加 API 请求处理（OpenAI 转换 / Gemini 原生透传 双入口）
+      if (url.pathname.startsWith("/openai") ||
+          url.pathname.startsWith("/gemini") ||
+          url.pathname.startsWith("/gemni") ||
+          url.pathname.startsWith("/v1beta/") ||
+          url.pathname.endsWith("/chat/completions") ||
+          url.pathname.endsWith("/embeddings") ||
+          url.pathname.endsWith("/models")) {
+        return handleAPIRequest(request, env);
+      }
+
+      // 处理静态资源
+      if (url.pathname === '/' || url.pathname === '/index.html') {
+        return new Response(await env.__STATIC_CONTENT.get('index.html'), {
+          headers: {
+            'content-type': 'text/html;charset=UTF-8',
+          },
+        });
+      }
+
+      // 处理其他静态资源
+      const asset = await env.__STATIC_CONTENT.get(url.pathname.slice(1));
+      if (asset) {
+        const contentType = getContentType(url.pathname);
+        return new Response(asset, {
+          headers: {
+            'content-type': contentType,
+          },
+        });
+      }
+
+      return new Response('Not found', { status: 404 });
+    } catch (e) {
+      console.error('Unhandled error:', e);
+      return new Response('Internal Server Error', { status: 500 });
     }
-    
-    // 添加 API 请求处理（OpenAI 转换 / Gemini 原生透传 双入口）
-    if (url.pathname.startsWith("/openai") ||
-        url.pathname.startsWith("/gemini") ||
-        url.pathname.startsWith("/gemni") ||
-        url.pathname.startsWith("/v1beta/") ||
-        url.pathname.endsWith("/chat/completions") ||
-        url.pathname.endsWith("/embeddings") ||
-        url.pathname.endsWith("/models")) {
-      return handleAPIRequest(request, env);
-    }
-
-    // 处理静态资源
-    if (url.pathname === '/' || url.pathname === '/index.html') {
-      console.log('Serving index.html',env);
-      return new Response(await env.__STATIC_CONTENT.get('index.html'), {
-        headers: {
-          'content-type': 'text/html;charset=UTF-8',
-        },
-      });
-    }
-
-    // 处理其他静态资源
-    const asset = await env.__STATIC_CONTENT.get(url.pathname.slice(1));
-    if (asset) {
-      const contentType = getContentType(url.pathname);
-      return new Response(asset, {
-        headers: {
-          'content-type': contentType,
-        },
-      });
-    }
-
-
-
-    return new Response('Not found', { status: 404 });
   },
 };
 
