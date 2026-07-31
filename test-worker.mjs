@@ -278,3 +278,62 @@ console.log("1️⃣1️⃣ thought_signature 透传（响应 + 请求 + 工具�
 }
 
 console.log(`\n🎉 全部 ${passed + 1} 组测试通过！`);
+
+console.log("1️⃣2️⃣ thought_signature id 编码方案（不依赖客户端保留自定义字段）");
+{
+  const { encodeSignatureToId, decodeSignatureFromId, getThoughtSignature } = await import("./src/api_proxy/worker.mjs");
+
+  // A. 编解码往返
+  const sig = "EpoGCpcGAXLI2nx/这是测试签名ABC123";
+  const encodedId = encodeSignatureToId(sig);
+  assert.ok(encodedId.startsWith("call_s_"), "编码 id 带 call_s_ 前缀");
+  assert.equal(decodeSignatureFromId(encodedId), sig, "id 解码还原签名");
+  // 无签名 → 正常随机 id
+  assert.ok(!encodeSignatureToId(undefined).startsWith("call_s_"));
+  assert.equal(decodeSignatureFromId("call_abc123"), undefined);
+  ok("编解码往返正确，无签名时不受影响");
+
+  // B. 响应方向：id 编码签名 + 自定义字段双通道
+  const cand = {
+    index: 0,
+    content: { parts: [{ functionCall: { name: "workspace_shell", args: { cmd: "ls" }, thought_signature: sig } }] },
+    finishReason: "STOP",
+  };
+  const out = transformCandidates("message", cand);
+  assert.ok(out.message.tool_calls[0].id.startsWith("call_s_"));
+  assert.equal(out.message.tool_calls[0].thought_signature, sig);
+  ok("响应方向：签名同时编码进 id 和自定义字段");
+
+  // C. 请求方向：客户端丢弃自定义字段、只回传 id → 代理从 id 解码
+  const messages = [
+    { role: "system", content: "助手" },
+    { role: "user", content: "执行 ls" },
+    { role: "assistant", content: null, tool_calls: [{ id: encodedId, type: "function", function: { name: "workspace_shell", arguments: "{\"cmd\":\"ls\"}" } }] }, // ← 无 thought_signature 字段
+    { role: "tool", tool_call_id: encodedId, content: "{\"result\":\"ok\"}" },
+    { role: "user", content: "继续" },
+  ];
+  const { contents } = await transformMessages(messages);
+  assert.equal(contents[1].parts[0].functionCall.thought_signature, sig, "functionCall 从 id 解码出签名");
+  assert.equal(contents[2].parts[0].functionResponse.thought_signature, sig, "functionResponse 从 id 解码出签名");
+  ok("请求方向：仅凭 id 即可还原签名（不依赖自定义字段）");
+
+  // D. 兜底：仍有缺失时自动关闭思考
+  const noSigReq = await transformRequest({
+    messages: [
+      { role: "user", content: "执行 ls" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_normal_id_1", type: "function", function: { name: "workspace_shell", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_normal_id_1", content: "{}" },
+    ],
+    tools: [{ type: "function", function: { name: "workspace_shell", description: "d", parameters: { type: "object", properties: {} } } }],
+  });
+  assert.deepEqual(noSigReq.generationConfig.thinkingConfig, { thinkingBudget: 0 }, "自动关闭思考兜底");
+  // 用户显式配置 thinking 时不被覆盖
+  const userThinking = await transformRequest({
+    messages: [{ role: "user", content: "hi" }],
+    thinking: { thinkingLevel: "HIGH" },
+  });
+  assert.deepEqual(userThinking.generationConfig.thinkingConfig, { thinkingLevel: "HIGH" });
+  ok("兜底自动关思考生效，用户显式配置不被覆盖");
+}
+
+console.log(`\n🎉 全部 ${passed + 1} 组测试通过！`);

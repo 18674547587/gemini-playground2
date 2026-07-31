@@ -312,9 +312,11 @@ const transformMsg = async ({ role, content, tool_calls }) => {
         args = tc.function.arguments;
       }
       const fc = { name: tc.function.name, args };
-      // 透传 thought_signature（Gemini 思考模型必需，保证多轮工具调用不降级）
-      if (tc.thought_signature) {
-        fc.thought_signature = tc.thought_signature;
+      // 透传 thought_signature：优先取自定义字段，其次从 tool_call id 解码
+      // （应对客户端丢弃自定义字段但保留 id 的情况）
+      const sig = getThoughtSignature(tc);
+      if (sig) {
+        fc.thought_signature = sig;
       }
       parts.push({ functionCall: fc });
     }
@@ -382,7 +384,7 @@ const transformMessages = async (messages) => {
           if (tc.id && tc.function?.name) {
             toolCallMap.set(tc.id, {
               name: tc.function.name,
-              thought_signature: tc.thought_signature,
+              thought_signature: getThoughtSignature(tc),
             });
           }
         }
@@ -516,12 +518,36 @@ const transformRequest = async (req) => {
       : undefined);
   const geminiTools = transformTools(tools);
   const toolConfig = transformToolChoice(req.tool_choice);
+  const { system_instruction, contents } = await transformMessages(req.messages) || {};
+
+  // 兜底防线：若本轮请求包含 functionCall 但全部缺少 thought_signature
+  // （说明客户端无法回传签名），且用户未显式配置 thinking，
+  // 则自动关闭思考，避免 Gemini 报错导致工具调用中断。
+  let needDisableThinking = false;
+  if (Array.isArray(contents) && req.thinking === undefined) {
+    const hasFunctionCall = contents.some(c =>
+      Array.isArray(c.parts) && c.parts.some(p => p.functionCall)
+    );
+    const allCallsHaveSignature = contents.every(c =>
+      !Array.isArray(c.parts) || c.parts.every(p =>
+        !p.functionCall || !!p.functionCall.thought_signature
+      )
+    );
+    needDisableThinking = hasFunctionCall && !allCallsHaveSignature;
+  }
+
+  const generationConfig = transformConfig(req);
+  if (needDisableThinking) {
+    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
+
   return {
-    ...(await transformMessages(req.messages)),
+    ...(system_instruction && { system_instruction }),
+    ...(contents && { contents }),
     safetySettings,
     ...(geminiTools && { tools: geminiTools }),
     ...(toolConfig && { toolConfig }),
-    generationConfig: transformConfig(req),
+    generationConfig,
   };
 };
 
@@ -535,6 +561,38 @@ const generateToolCallId = () => {
   const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
   return "call_" + Array.from({ length: 24 }, randomChar).join("");
+};
+
+// === thought_signature 编解码 ===
+// 背景：Gemini 思考模型的 functionCall part 必须携带 thought_signature，
+// 但 OpenAI 格式的 tool_calls 没有标准字段，部分客户端会丢弃自定义字段。
+// 解决：把签名编码进 tool_call 的 id（标准字段，客户端必然原样保留），
+// 请求方向再从 id 解码还原。自定义字段 thought_signature 作为双保险同时附加。
+const SIG_ID_PREFIX = "call_s_";
+
+// 有签名时生成 "call_s_<base64url(sig)>" 的 id，无签名时正常随机 id
+const encodeSignatureToId = (sig) => {
+  if (!sig) return generateToolCallId();
+  return SIG_ID_PREFIX + Buffer.from(String(sig), "utf8").toString("base64url").replace(/=+$/, "");
+};
+
+// 从 id 解码签名（仅识别 call_s_ 前缀的编码 id，普通随机 id 返回 undefined）
+const decodeSignatureFromId = (id) => {
+  if (typeof id !== "string" || !id.startsWith(SIG_ID_PREFIX)) { return; }
+  const b64 = id.slice(SIG_ID_PREFIX.length);
+  try {
+    const decoded = Buffer.from(b64, "base64url").toString("utf8");
+    return decoded.length > 0 ? decoded : undefined;
+  } catch {
+    return;
+  }
+};
+
+// 获取 tool_call 上的 thought_signature：优先自定义字段，其次从 id 解码
+const getThoughtSignature = (tc) => {
+  if (!tc) { return; }
+  if (tc.thought_signature) { return tc.thought_signature; }
+  return decodeSignatureFromId(tc.id);
 };
 
 const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse#finishreason
@@ -569,17 +627,18 @@ const transformCandidates = (key, cand) => {
   let finish_reason = reasonsMap[cand.finishReason] || cand.finishReason;
   if (callParts.length > 0) {
     message.tool_calls = callParts.map(p => {
+      const sig = p.functionCall.thought_signature;
       const tc = {
-        id: generateToolCallId(),
+        id: encodeSignatureToId(sig),
         type: "function",
         function: {
           name: p.functionCall.name,
           arguments: JSON.stringify(p.functionCall.args ?? {}),
         },
       };
-      // Gemini 思考模型：透传 thought_signature（缺失会导致后续轮次工具调用报错/降级）
-      if (p.functionCall.thought_signature) {
-        tc.thought_signature = p.functionCall.thought_signature;
+      // 双保险：自定义字段 + id 编码
+      if (sig) {
+        tc.thought_signature = sig;
       }
       return tc;
     });
@@ -654,18 +713,19 @@ function transformResponseStream (data, stop, first) {
   }
   if (callParts.length > 0) {
     delta.tool_calls = callParts.map(p => {
+      const sig = p.functionCall.thought_signature;
       const tc = {
         index: this.toolCallIndex++,
-        id: generateToolCallId(),
+        id: encodeSignatureToId(sig),
         type: "function",
         function: {
           name: p.functionCall.name,
           arguments: JSON.stringify(p.functionCall.args ?? {}),
         },
       };
-      // Gemini 思考模型：透传 thought_signature（缺失会导致后续轮次工具调用报错/降级）
-      if (p.functionCall.thought_signature) {
-        tc.thought_signature = p.functionCall.thought_signature;
+      // 双保险：自定义字段 + id 编码
+      if (sig) {
+        tc.thought_signature = sig;
       }
       return tc;
     });
@@ -747,4 +807,7 @@ export {
   transformRequest,
   generateToolCallId,
   cleanSchema,
+  encodeSignatureToId,
+  decodeSignatureFromId,
+  getThoughtSignature,
 };
