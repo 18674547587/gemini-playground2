@@ -1,6 +1,15 @@
-//Author: PublicAffairs
-//Project: https://github.com/PublicAffairs/openai-gemini
-//MIT License : https://github.com/PublicAffairs/openai-gemini/blob/main/LICENSE
+// Author: PublicAffairs
+// Project: https://github.com/PublicAffairs/openai-gemini
+// MIT License : https://github.com/PublicAffairs/openai-gemini/blob/main/LICENSE
+//
+// === 增强版说明（在原始 OpenAI→Gemini 转换基础上补全原生能力）===
+//  1. Function Calling 全链路：tools / tool_choice / role:"tool" 消息（functionResponse）
+//  2. 兼容旧版 OpenAI functions 参数
+//  3. 流式（SSE）下的 functionCall 增量输出（tool_calls delta）
+//  4. 并行函数调用（单个响应多个 tool_calls）
+//  5. thinking（思考）配置透传（Gemini 3 原生能力，可选）
+//  6. 默认模型更新为 gemini-3-flash（2.x / 1.5 系列已退役返回 404）
+//  7. 不再修改调用方传入的 messages 对象（消除副作用）
 
 import { Buffer } from "node:buffer";
 
@@ -141,7 +150,8 @@ async function handleEmbeddings (req, apiKey) {
   return new Response(body, fixCors(response));
 }
 
-const DEFAULT_MODEL = "gemini-1.5-pro-latest";
+// 默认模型更新：2.x / 1.5 系列已退役（404），3.x 免费可用
+const DEFAULT_MODEL = "gemini-3-flash";
 async function handleCompletions (req, apiKey) {
   let model = DEFAULT_MODEL;
   switch(true) {
@@ -160,7 +170,7 @@ async function handleCompletions (req, apiKey) {
   const response = await fetch(url, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(await transformRequest(req)), // try
+    body: JSON.stringify(await transformRequest(req)),
   });
 
   let body = response.body;
@@ -178,7 +188,7 @@ async function handleCompletions (req, apiKey) {
           transform: toOpenAiStream,
           flush: toOpenAiStreamFlush,
           streamIncludeUsage: req.stream_options?.include_usage,
-          model, id, last: [],
+          model, id, last: [], toolCallIndex: 0,
         }))
         .pipeThrough(new TextEncoderStream());
     } else {
@@ -239,6 +249,16 @@ const transformConfig = (req) => {
         throw new HttpError("Unsupported response_format.type", 400);
     }
   }
+  // 可选：thinking 配置透传（Gemini 3 原生能力）
+  // 请求体里可传 "thinking": {"thinkingBudget": 0} / {"thinkingLevel": "LOW"}
+  // 或简化写法 "thinking": 0（数字 = thinkingBudget，0 即关闭思考）
+  if (req.thinking !== undefined) {
+    if (typeof req.thinking === "number") {
+      cfg.thinkingConfig = { thinkingBudget: req.thinking };
+    } else if (typeof req.thinking === "object" && req.thinking !== null) {
+      cfg.thinkingConfig = req.thinking;
+    }
+  }
   return cfg;
 };
 
@@ -270,18 +290,40 @@ const parseImg = async (url) => {
   };
 };
 
-const transformMsg = async ({ role, content }) => {
+/**
+ * 单条消息 → Gemini parts
+ * 支持：
+ *  - content 为字符串（system/user/assistant 文本）
+ *  - content 为数组（多模态：text / image_url / input_audio）
+ *  - assistant 消息携带 tool_calls → functionCall parts
+ *  - content 为 null（带 tool_calls 的 assistant 消息）
+ */
+const transformMsg = async ({ role, content, tool_calls }) => {
   const parts = [];
+
+  // assistant 消息里的 tool_calls → Gemini functionCall parts
+  if (Array.isArray(tool_calls)) {
+    for (const tc of tool_calls) {
+      if (tc.type !== "function" || !tc.function?.name) { continue; }
+      let args = {};
+      if (typeof tc.function.arguments === "string") {
+        try { args = JSON.parse(tc.function.arguments); } catch { args = {}; }
+      } else if (tc.function.arguments && typeof tc.function.arguments === "object") {
+        args = tc.function.arguments;
+      }
+      parts.push({ functionCall: { name: tc.function.name, args } });
+    }
+  }
+
   if (!Array.isArray(content)) {
-    // system, user: string
-    // assistant: string or null (Required unless tool_calls is specified.)
-    parts.push({ text: content });
+    // system, user: string; assistant: string 或 null（Required unless tool_calls is specified.）
+    if (content != null && content !== "") {
+      parts.push({ text: content });
+    }
     return { role, parts };
   }
-  // user:
-  // An array of content parts with a defined type.
-  // Supported options differ based on the model being used to generate the response.
-  // Can contain text, image, or audio inputs.
+
+  // user: 多模态内容数组
   for (const item of content) {
     switch (item.type) {
       case "text":
@@ -308,36 +350,129 @@ const transformMsg = async ({ role, content }) => {
   return { role, parts };
 };
 
+/**
+ * messages 数组 → Gemini contents + system_instruction
+ * 支持完整工具调用链路：
+ *  - system → system_instruction
+ *  - assistant（含 tool_calls）→ model + functionCall parts
+ *  - tool（工具结果）→ user + functionResponse parts
+ *  - user → user
+ * 不再修改传入的 messages 对象（无副作用）。
+ */
 const transformMessages = async (messages) => {
   if (!messages) { return; }
   const contents = [];
   let system_instruction;
+  // 记录 OpenAI tool_call_id → 函数名，用于把 tool 消息还原为 functionResponse
+  const toolCallMap = new Map();
+
   for (const item of messages) {
-    if (item.role === "system") {
-      delete item.role;
-      system_instruction = await transformMsg(item);
+    const { role } = item;
+    if (role === "system") {
+      const { parts } = await transformMsg(item);
+      system_instruction = { parts };
+    } else if (role === "assistant") {
+      if (Array.isArray(item.tool_calls)) {
+        for (const tc of item.tool_calls) {
+          if (tc.id && tc.function?.name) {
+            toolCallMap.set(tc.id, tc.function.name);
+          }
+        }
+      }
+      contents.push(await transformMsg({ ...item, role: "model" }));
+    } else if (role === "tool") {
+      // OpenAI: { role:"tool", tool_call_id, content } → Gemini functionResponse（user 角色）
+      const name = item.name || toolCallMap.get(item.tool_call_id);
+      let response = item.content;
+      if (typeof response === "string") {
+        try { response = JSON.parse(response); } catch { /* 保留字符串 */ }
+      }
+      contents.push({
+        role: "user",
+        parts: [{ functionResponse: { name, response } }],
+      });
     } else {
-      item.role = item.role === "assistant" ? "model" : "user";
-      contents.push(await transformMsg(item));
+      // user（含 role 缺失/未知的情况按 user 处理）
+      contents.push(await transformMsg({ ...item, role: "user" }));
     }
   }
+
   if (system_instruction && contents.length === 0) {
-    contents.push({ role: "model", parts: { text: " " } });
+    contents.push({ role: "model", parts: [{ text: " " }] });
   }
   //console.info(JSON.stringify(contents, 2));
   return { system_instruction, contents };
 };
 
-const transformRequest = async (req) => ({
-  ...await transformMessages(req.messages),
-  safetySettings,
-  generationConfig: transformConfig(req),
-});
+// === Function Calling 转换 ===
+
+// OpenAI tool → Gemini functionDeclaration
+const transformTool = (tool) => {
+  if (tool.type !== "function" || !tool.function?.name) {
+    throw new HttpError(`Unsupported tool: ${JSON.stringify(tool).slice(0, 200)}`, 400);
+  }
+  const { name, description, parameters } = tool.function;
+  return {
+    name,
+    description: description ?? "",
+    parameters: parameters ?? { type: "object", properties: {} },
+  };
+};
+
+// OpenAI tools 数组 → Gemini tools（functionDeclarations）
+const transformTools = (tools) => {
+  if (!Array.isArray(tools) || tools.length === 0) { return; }
+  return [{ functionDeclarations: tools.map(transformTool) }];
+};
+
+// OpenAI tool_choice → Gemini toolConfig
+// "auto"（默认）→ 不传（Gemini 默认 AUTO）
+// "none" → NONE | "required" → ANY
+// {type:"function", function:{name}} → ANY + allowedFunctionNames
+const transformToolChoice = (toolChoice) => {
+  if (!toolChoice || toolChoice === "auto") { return; }
+  if (typeof toolChoice === "string") {
+    switch (toolChoice) {
+      case "none": return { functionCallingConfig: { mode: "NONE" } };
+      case "required": return { functionCallingConfig: { mode: "ANY" } };
+      default: throw new HttpError(`Unsupported tool_choice: ${toolChoice}`, 400);
+    }
+  }
+  if (toolChoice.type === "function") {
+    const name = toolChoice.function?.name;
+    if (!name) { throw new HttpError("tool_choice.function.name is required", 400); }
+    return { functionCallingConfig: { mode: "ANY", allowedFunctionNames: [name] } };
+  }
+  throw new HttpError("Unsupported tool_choice", 400);
+};
+
+const transformRequest = async (req) => {
+  // 兼容旧版 OpenAI functions 参数（无 tools 时）
+  const tools = req.tools ??
+    (Array.isArray(req.functions)
+      ? req.functions.map(f => ({ type: "function", function: f }))
+      : undefined);
+  const geminiTools = transformTools(tools);
+  const toolConfig = transformToolChoice(req.tool_choice);
+  return {
+    ...(await transformMessages(req.messages)),
+    safetySettings,
+    ...(geminiTools && { tools: geminiTools }),
+    ...(toolConfig && { toolConfig }),
+    generationConfig: transformConfig(req),
+  };
+};
 
 const generateChatcmplId = () => {
   const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
   return "chatcmpl-" + Array.from({ length: 29 }, randomChar).join("");
+};
+
+const generateToolCallId = () => {
+  const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
+  return "call_" + Array.from({ length: 24 }, randomChar).join("");
 };
 
 const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse#finishreason
@@ -350,16 +485,47 @@ const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse
   // :"function_call",
 };
 const SEP = "\n\n|>";
-const transformCandidates = (key, cand) => ({
-  index: cand.index || 0, // 0-index is absent in new -002 models response
-  [key]: {
+
+/**
+ * Gemini candidate → OpenAI message/delta
+ * 支持：
+ *  - 纯文本 → message.content
+ *  - functionCall → message.tool_calls（finish_reason 改为 "tool_calls"）
+ *  - 文本 + functionCall 并存 → content 与 tool_calls 同时输出
+ *  - 无文本内容 → content 为 null（符合 OpenAI 规范）
+ */
+const transformCandidates = (key, cand) => {
+  const parts = cand.content?.parts || [];
+  const textParts = parts.filter(p => p.text);
+  const callParts = parts.filter(p => p.functionCall);
+
+  const message = {
     role: "assistant",
-    content: cand.content?.parts.map(p => p.text).join(SEP) },
-  logprobs: null,
-  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
-});
+    content: textParts.length > 0 ? textParts.map(p => p.text).join(SEP) : null,
+  };
+
+  let finish_reason = reasonsMap[cand.finishReason] || cand.finishReason;
+  if (callParts.length > 0) {
+    message.tool_calls = callParts.map(p => ({
+      id: generateToolCallId(),
+      type: "function",
+      function: {
+        name: p.functionCall.name,
+        arguments: JSON.stringify(p.functionCall.args ?? {}),
+      },
+    }));
+    finish_reason = "tool_calls";
+  }
+
+  return {
+    index: cand.index || 0, // 0-index is absent in new -002 models response
+    [key]: message,
+    logprobs: null,
+    finish_reason,
+  };
+};
+
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
-const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 
 const transformUsage = (data) => ({
   completion_tokens: data.candidatesTokenCount,
@@ -398,10 +564,49 @@ async function parseStreamFlush (controller) {
   }
 }
 
+/**
+ * Gemini 流式 chunk → OpenAI SSE delta
+ * 支持流式 functionCall：tool_calls delta（index 跨 chunk 递增，符合 OpenAI 规范）
+ * 收尾 chunk（stop）：finish_reason 按是否发生函数调用输出 "tool_calls" / "stop"
+ */
 function transformResponseStream (data, stop, first) {
-  const item = transformCandidatesDelta(data.candidates[0]);
-  if (stop) { item.delta = {}; } else { item.finish_reason = null; }
-  if (first) { item.delta.content = ""; } else { delete item.delta.role; }
+  const cand = data.candidates[0];
+  const parts = cand.content?.parts || [];
+  const textParts = parts.filter(p => p.text);
+  const callParts = parts.filter(p => p.functionCall);
+
+  const delta = {};
+  if (first) {
+    delta.role = "assistant";
+    delta.content = "";
+  }
+  if (textParts.length > 0) {
+    delta.content = (delta.content ?? "") + textParts.map(p => p.text).join("");
+  }
+  if (callParts.length > 0) {
+    delta.tool_calls = callParts.map(p => ({
+      index: this.toolCallIndex++,
+      id: generateToolCallId(),
+      type: "function",
+      function: {
+        name: p.functionCall.name,
+        arguments: JSON.stringify(p.functionCall.args ?? {}),
+      },
+    }));
+  }
+
+  const item = {
+    index: cand.index || 0,
+    delta,
+    finish_reason: null,
+  };
+
+  if (stop) {
+    const hasCall = callParts.length > 0;
+    item.delta = {};
+    item.finish_reason = hasCall ? "tool_calls" : "stop";
+  }
+
   const output = {
     id: this.id,
     choices: [item],
@@ -454,3 +659,14 @@ async function toOpenAiStreamFlush (controller) {
     controller.enqueue("data: [DONE]" + delimiter);
   }
 }
+
+// 导出内部转换函数（仅用于测试与二次开发，不影响 default export）
+export {
+  transformTools,
+  transformToolChoice,
+  transformMessages,
+  transformCandidates,
+  transformConfig,
+  transformRequest,
+  generateToolCallId,
+};

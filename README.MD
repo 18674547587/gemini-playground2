@@ -105,9 +105,29 @@ curl --location 'https://your.domain.com/v1/chat/completions' \
             "content": "Testing. Just say hi and nothing else."
         }
     ],
-    "model": "gemini-2.5-flash"
+    "model": "gemini-3-flash"
 }'
 ```
+
+#### 函数调用（Function Calling）支持：
+
+代理已完整支持 OpenAI 格式的 Function Calling（工具调用），可对接 MCP、Shell 等工具：
+
+- `tools` → Gemini `functionDeclarations`（支持并行函数调用）
+- `tool_choice` → Gemini `toolConfig`（`auto` / `none` / `required` / 指定函数）
+- `role: "tool"` 消息 → Gemini `functionResponse`（多轮工具调用链路完整）
+- 流式（SSE）下同样支持 `tool_calls` 增量输出
+- 兼容旧版 `functions` 参数
+- 可选 `thinking` 配置透传（Gemini 3 原生思考控制，如 `"thinking": {"thinkingBudget": 0}`）
+
+> 注意：`gemini-2.x` / `gemini-1.5` 系列模型已退役（API 返回 404），请使用 `gemini-3-flash` / `gemini-3.1-flash-lite` 等 3.x 模型。代理默认模型为 `gemini-3-flash`。
+
+#### 功能测试：
+
+```bash
+node test-worker.mjs
+```
+
 ### ChatBOX：
    <details>
    <summary>如图</summary>
