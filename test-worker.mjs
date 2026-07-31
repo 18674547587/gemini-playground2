@@ -189,3 +189,48 @@ console.log("9️⃣ tool_call_id 生成");
 }
 
 console.log(`\n🎉 全部 ${passed} 组测试通过！`);
+
+console.log("🔟 JSON Schema 清洗（const → enum、删除不支持字段、嵌套递归）");
+{
+  const tools = [{
+    type: "function",
+    function: {
+      name: "complex_tool",
+      description: "复杂工具",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: { type: "string", const: "auto", $ref: "#/definitions/x", $schema: "http://json-schema.org/draft-07/schema#" },
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                level: { type: "number", const: 3 },
+                name: { type: "string" },
+              },
+            },
+          },
+          flag: { type: "boolean", default: true, title: "Flag" },
+          choice: { type: "string", oneOf: [{ const: "a" }, { const: "b" }] },
+        },
+        required: ["mode"],
+      },
+    },
+  }];
+  const out = transformTools(tools);
+  const p = out[0].functionDeclarations[0].parameters;
+  // const → enum
+  assert.deepEqual(p.properties.mode, { type: "string", enum: ["auto"] });
+  assert.equal(p.properties.mode.$ref, undefined);
+  assert.equal(p.properties.mode.$schema, undefined);
+  // 嵌套 items 递归
+  assert.deepEqual(p.properties.items.items.properties.level, { type: "number", enum: [3] });
+  // default/title 删除
+  assert.deepEqual(p.properties.flag, { type: "boolean" });
+  // oneOf 删除（其内部 const 不再处理，因为 oneOf 整体被删）
+  assert.deepEqual(p.properties.choice, { type: "string" });
+  ok("const→enum、$ref/$schema/default/title/oneOf 清理、嵌套递归 全部正确");
+}
+
+console.log(`\n🎉 全部 ${passed + 1} 组测试通过！`);

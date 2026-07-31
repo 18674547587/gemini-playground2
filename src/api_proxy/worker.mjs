@@ -406,6 +406,54 @@ const transformMessages = async (messages) => {
 
 // === Function Calling 转换 ===
 
+// Gemini functionDeclaration.parameters 不支持的 JSON Schema 关键字
+// （Gemini 仅支持子集：type/format/description/nullable/enum/items/properties/
+//   required/minItems/maxItems/minProperties/maxProperties/minLength/maxLength/minimum/maximum）
+const SCHEMA_UNSUPPORTED = new Set([
+  "$schema", "$id", "$ref", "definitions", "examples", "example",
+  "oneOf", "anyOf", "allOf", "not", "if", "then", "else",
+  "patternProperties", "additionalItems", "contains", "propertyNames",
+  "default", "title", "deprecated", "readOnly", "writeOnly",
+  "contentMediaType", "contentEncoding",
+]);
+
+// 递归清洗 JSON Schema：
+//  - const → enum（语义等价，Gemini 支持 enum）
+//  - 删除 Gemini 不支持的字段
+//  - 递归处理嵌套的 properties / items
+const cleanSchema = (schema) => {
+  if (Array.isArray(schema)) {
+    return schema.map(cleanSchema);
+  }
+  if (schema && typeof schema === "object") {
+    const out = {};
+    for (const [key, value] of Object.entries(schema)) {
+      if (key === "const") {
+        // Gemini 不支持 const，转为等价的 enum
+        out.enum = [value];
+        continue;
+      }
+      if (SCHEMA_UNSUPPORTED.has(key)) {
+        continue; // 直接删除不支持的字段
+      }
+      if (key === "properties" && value && typeof value === "object") {
+        // 关键：properties 内每个属性自身的 schema 也要递归清洗
+        const cleaned = {};
+        for (const [propName, propSchema] of Object.entries(value)) {
+          cleaned[propName] = cleanSchema(propSchema);
+        }
+        out[key] = cleaned;
+      } else if (key === "items") {
+        out[key] = cleanSchema(value);
+      } else {
+        out[key] = value;
+      }
+    }
+    return out;
+  }
+  return schema;
+};
+
 // OpenAI tool → Gemini functionDeclaration
 const transformTool = (tool) => {
   if (tool.type !== "function" || !tool.function?.name) {
@@ -415,7 +463,7 @@ const transformTool = (tool) => {
   return {
     name,
     description: description ?? "",
-    parameters: parameters ?? { type: "object", properties: {} },
+    parameters: parameters ? cleanSchema(parameters) : { type: "object", properties: {} },
   };
 };
 
@@ -663,10 +711,12 @@ async function toOpenAiStreamFlush (controller) {
 // 导出内部转换函数（仅用于测试与二次开发，不影响 default export）
 export {
   transformTools,
+  transformTool,
   transformToolChoice,
   transformMessages,
   transformCandidates,
   transformConfig,
   transformRequest,
   generateToolCallId,
+  cleanSchema,
 };
