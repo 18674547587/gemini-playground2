@@ -22,17 +22,26 @@ export default {
         return handleAPIRequest(request, env);
       }
 
-      // 处理静态资源
+      // 处理静态资源：优先新版 assets 绑定（env.ASSETS），
+      // 自动处理 content-type 与缓存；回退旧版 Workers Sites KV（__STATIC_CONTENT）
+      if (env.ASSETS && typeof env.ASSETS.fetch === "function") {
+        return env.ASSETS.fetch(request);
+      }
+
+      // 旧版 Workers Sites KV 回退
       if (url.pathname === '/' || url.pathname === '/index.html') {
-        return new Response(await env.__STATIC_CONTENT.get('index.html'), {
-          headers: {
-            'content-type': 'text/html;charset=UTF-8',
-          },
-        });
+        const html = await env.__STATIC_CONTENT?.get('index.html');
+        if (html) {
+          return new Response(html, {
+            headers: {
+              'content-type': 'text/html;charset=UTF-8',
+            },
+          });
+        }
       }
 
       // 处理其他静态资源
-      const asset = await env.__STATIC_CONTENT.get(url.pathname.slice(1));
+      const asset = await env.__STATIC_CONTENT?.get(url.pathname.slice(1));
       if (asset) {
         const contentType = getContentType(url.pathname);
         return new Response(asset, {
