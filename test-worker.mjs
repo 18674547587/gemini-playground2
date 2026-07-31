@@ -337,3 +337,31 @@ console.log("1️⃣2️⃣ thought_signature id 编码方案（不依赖客户�
 }
 
 console.log(`\n🎉 全部 ${passed + 1} 组测试通过！`);
+
+console.log("1️⃣4️⃣ Gemini 原生透传模式（路径识别 + 不干扰 OpenAI 转换）");
+{
+  const { isNativeProxyPath } = await import("./src/api_proxy/worker.mjs");
+
+  // 原生 Gemini API 路径 → 透传
+  assert.equal(isNativeProxyPath("/v1beta/models/gemini-3-flash:generateContent"), true);
+  assert.equal(isNativeProxyPath("/v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse"), true);
+  assert.equal(isNativeProxyPath("/v1beta/models"), true);
+  assert.equal(isNativeProxyPath("/v1beta/"), true);
+  // OpenAI 兼容路径 → 不触发透传（走转换）
+  assert.equal(isNativeProxyPath("/v1/chat/completions"), false);
+  assert.equal(isNativeProxyPath("/v1/models"), false);
+  assert.equal(isNativeProxyPath("/"), false);
+  assert.equal(isNativeProxyPath(undefined), false);
+  ok("原生路径识别正确，OpenAI 路径不受影响");
+
+  // 回归：转换模式功能完好
+  const out = await transformRequest({
+    model: "gemini-3-flash",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{ type: "function", function: { name: "f1", description: "d", parameters: { type: "object", properties: {} } } }],
+  });
+  assert.equal(out.tools[0].functionDeclarations[0].name, "f1");
+  ok("OpenAI 转换模式回归正常");
+}
+
+console.log(`\n🎉 全部 ${passed + 1} 组测试通过！`);

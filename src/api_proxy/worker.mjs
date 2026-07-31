@@ -32,6 +32,10 @@ export default {
       };
       const { pathname } = new URL(request.url);
       switch (true) {
+        case isNativeProxyPath(pathname):
+          // Gemini 原生接口透传模式：客户端原生格式请求原样转发，不做转换
+          return handleNativeProxy(request, apiKey)
+            .catch(errHandler);
         case pathname.endsWith("/chat/completions"):
           assert(request.method === "POST");
           return handleCompletions(await request.json(), apiKey)
@@ -62,7 +66,7 @@ class HttpError extends Error {
 }
 
 // 代理版本标识：用于确认部署是否运行最新代码
-const PROXY_VERSION = "v4.3.0";
+const PROXY_VERSION = "v4.4.0";
 
 const fixCors = ({ headers, status, statusText }) => {
   headers = new Headers(headers);
@@ -83,6 +87,51 @@ const handleOPTIONS = async () => {
 
 const BASE_URL = "https://generativelanguage.googleapis.com";
 const API_VERSION = "v1beta";
+
+// === Gemini 原生接口透传模式 ===
+// 客户端以 Gemini 原生格式请求（路径以 /v1beta/ 开头）时，
+// 代理只做网络中转（解决部分地区无法直连 Google 的问题），
+// 请求体、查询参数、流式响应全部原样转发，不做任何格式转换。
+// 这样 thought_signature 等原生机制由客户端 SDK 自行管理，无丢失问题。
+
+// 判断是否为 Gemini 原生 API 路径（透传模式）
+const isNativeProxyPath = (pathname) =>
+  typeof pathname === "string" && pathname.startsWith("/v1beta/");
+
+// 透传处理：构造目标 URL + 归一化鉴权 + 原样转发
+const handleNativeProxy = async (request, bearerKey) => {
+  const url = new URL(request.url);
+  const targetUrl = `${BASE_URL}${url.pathname}${url.search}`;
+
+  const headers = new Headers(request.headers);
+  // 清理 hop-by-hop 与本地代理相关头
+  headers.delete("host");
+  headers.delete("content-length");
+  for (const h of ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade"]) {
+    headers.delete(h);
+  }
+  // 鉴权归一化：Gemini 原生接口使用 x-goog-api-key
+  // 优先级：请求头 x-goog-api-key > Authorization Bearer > URL 查询参数 ?key=
+  if (!headers.get("x-goog-api-key")) {
+    const keyFromQuery = url.searchParams.get("key");
+    if (bearerKey) {
+      headers.set("x-goog-api-key", bearerKey);
+    } else if (keyFromQuery) {
+      headers.set("x-goog-api-key", keyFromQuery);
+    }
+  }
+  headers.delete("authorization");
+
+  const response = await fetch(targetUrl, {
+    method: request.method,
+    headers,
+    body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
+    redirect: "manual",
+  });
+
+  return new Response(response.body, fixCors(response));
+};
 
 // https://github.com/google-gemini/generative-ai-js/blob/cf223ff4a1ee5a2d944c53cddb8976136382bee6/src/requests/request.ts#L71
 const API_CLIENT = "genai-js/0.21.0"; // npm view @google/generative-ai version
@@ -802,6 +851,7 @@ async function toOpenAiStreamFlush (controller) {
 
 // 导出内部转换函数（仅用于测试与二次开发，不影响 default export）
 export {
+  isNativeProxyPath,
   transformTools,
   transformTool,
   transformToolChoice,

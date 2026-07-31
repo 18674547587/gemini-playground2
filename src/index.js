@@ -9,8 +9,9 @@ export default {
       return handleWebSocket(request, env);
     }
     
-    // 添加 API 请求处理
-    if (url.pathname.endsWith("/chat/completions") ||
+    // 添加 API 请求处理（含 Gemini 原生透传）
+    if (url.pathname.startsWith("/v1beta/") ||
+        url.pathname.endsWith("/chat/completions") ||
         url.pathname.endsWith("/embeddings") ||
         url.pathname.endsWith("/models")) {
       return handleAPIRequest(request, env);
